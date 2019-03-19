@@ -198,7 +198,7 @@ sub create_job_file {
 	print FO "#\$ -V\n";
 	print FO "#\$ -l mem_free=$memory"."G\n" if ($memory ne "");
 	print FO "#\$ -l h_rt=$wall_time:00:00\n" if ($wall_time ne "");
-    print FO "#\$ -m beas\n\n";
+   	print FO "#\$ -m beas\n\n";
 	print FO "#\$ -o $stdout\n";
 	print FO "#\$ -e $stderr\n";
 	print FO "$line || echo \"Job crashed\"\n";
