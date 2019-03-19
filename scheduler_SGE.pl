@@ -5,17 +5,25 @@ use strict;
 use warnings;
 use Getopt::Long qw(:config no_ignore_case no_auto_abbrev);
 
-my $action    = lc($ARGV[0]);
+my $action    = $ARGV[0];
 my $jobs_name = $ARGV[1];
 my $file_in   = $ARGV[2];
 
-my $usage = "USAGE: $0 action[push|crashed|stop] jobs_name jobs_file  
-OPTIONAL PARAMETERS: -cores [number_of_cores] -memory [max memory in GB, for example 3G] -time [max time allowed in hours]\n\n";
-my $purpose = "PURPOSE: $0 reads in a jobs file (where every line is a job) and submits these jobs using qsub. 
-Could also be used to stop running jobs or to get a list of jobs that have crashed\n";
+## Get other optional parameters. Needed when pushing jobs
+my $n_cores = 0;
+my $memory = my $wall_time = "";
+GetOptions ("cores:i"  => \$n_cores, "memory:s" => \$memory, "time:s" =>\$wall_time);
 
-#### Sanity checks to figure out if all parameters are fine:
+my $usage = "USAGE: $0 action[push|crashed|stop|clean] jobs_name jobs_file  
+OPTIONAL PARAMETERS: -cores [number_of_cores] -memory [max memory in GB, for example 3 --> this would imply 3GB of memory] -time [max time allowed in hours]\n\n";
+my $purpose = "PURPOSE: $0 reads in a jobs file (where every line is a job) and submits these jobs to a SGE cluster. 
+$0 is basically a wrapper to submit a list of jobs and to monitor these jobs. Could also be used to stop running jobs,
+or to get a list of jobs that crashed from this given list.";
+
 die $usage.$purpose if (scalar(@ARGV) < 2);  ## need at least two parameters -- the action and the job name.
+
+#### A couple of sanity checks to ensure that all parameters are ok:
+$action = lc($action);
 die "Undefined action '$action'\n" if ($action ne "push" && $action ne "stop" && $action ne "crashed" && $action ne "clean");
 die "Insufficient number of arguments for the action 'push'. You need atleast 3\n" if ($action eq "push" && scalar(@ARGV) < 3);
 
@@ -23,60 +31,22 @@ if ( ($action eq "stop" || $action eq "crashed" || $action eq "clean") && (scala
 	print "WARNING !! You only need 2 parameters with the action '$action'. Barring the first two parameters, everything else will be ignored\n";	
 }
 
-## Get other optional parameters. Needed when pushing jobs
-my $n_cores = 0;
-my $memory = my $wall_time = "";
-GetOptions ("cores:i"  => \$n_cores, "memory:s" => \$memory, "time:s" =>\$wall_time);
-
 my $home_dir = `pwd`; chomp $home_dir;
 my $user = `echo \$USER`; chomp $user;
 
-
 if ($action eq "clean") {
-	my $jobs_dir = $home_dir."/.jobs_input/$jobs_name";
-	die "The jobs directory '$jobs_dir' does not exist. So nothing will be cleaned\n" if (! -d $jobs_dir);
-	
-	my $delete_call = "rm -r $jobs_dir";
-	system($delete_call) == 0 || die "Error cleaning the jobs directory '$jobs_dir'\n";
-	exit;
-}
-
-if ($action eq "crashed") {
-	## go to the directory and find which jobs have crashed
-	my $jobs_stderr = "$home_dir/\.jobs_input/$jobs_name/stdout";
-	my $ls = `ls $jobs_stderr`;
-	
-	foreach my $file(split /\n/,$ls) {
-		my $stdout_file = "$jobs_stderr/$file";
-		my $job_ct = $file;
-		$job_ct =~s/o.//;
-		
-		my $job_status = check_job_failed($stdout_file);
-		if ($job_status == 1) {
-			my $job_file = "$home_dir/\.jobs_input/$jobs_name/o.$job_ct";
-			my $job_line = extract_job_line($job_file);
-			print "$job_line\n";	
-		}
-	}
-	exit;
+	action_clean();	
 }
 
 if ($action eq "stop") {
-	## Get the lock file that contains information about the current set of jobs and then do a qdel on these jobs
-	my $job_ids_file = "$home_dir/\.jobs_input/$jobs_name/jobIDs.txt";
-	die "Cannot find the job_id file '$job_ids_file'. Aborting\n" if (! -e $job_ids_file);
-	
-	open(FI,"$job_ids_file");
-	while (my $job = <FI>) {
-		chomp $job;
-		`qdel $job`;
-	}
-	close FI;
-	print "Stopped jobs for the jobsList '$jobs_name'\n";
-	exit;
+	action_stop();	
 }
 
-## otherwise you are pushing jobs
+if ($action eq "crashed") {
+	action_crashed();	
+}
+
+## otherwise push jobs
 if (-d "$home_dir/\.jobs_input/$jobs_name") {
 	die "ERROR!! The jobs name directory exists. Delete this and resubmit i.e. do a 'rm -r $home_dir/\.jobs_input/$jobs_name' and resubmit\n";
 } else {
@@ -92,7 +62,6 @@ my $stderr_dir = "$home_dir/\.jobs_input/$jobs_name/stderr";
 my %jobs_id_hash = (); ## a hash where the key is the job identifier and the value is the job (i.e. the particular line from the jobs file)
 my $ct = 0;
 
-my @all_job_ids = ();
 ### create a job_info file that contains all the job ids
 open(FOS,">$home_dir/\.jobs_input/$jobs_name/jobIDs.txt") || die "Error writing to the jobIDs file\n";
 open(FI,$file_in) || die "Error opening input file '$file_in'\n";
@@ -112,22 +81,20 @@ while (my $line = <FI>) {
 	my $job_id = (split / /,$job_id_line)[2];
 	$jobs_id_hash{$job_id} = $ct;
 	print FOS "$job_id\n";
-	push(@all_job_ids,$job_id);
-	
 	$ct++;
 }
 close FI;
 close FOS;
 sleep 10;
 
-## All jobs have been submitted, now check their status
-my $jobs_all_done = 0;
+my @all_job_ids = keys(%jobs_id_hash);
 my $total_jobs = $ct;
-my $time_total = 0;
-my $jobs_failed = 0;
 
-while ($jobs_all_done != 1) {
-	
+## All jobs have been submitted, now check their status
+my $jobs_all_done = my $jobs_failed = 0;
+my $time_total = 0;
+
+while ($jobs_all_done != 1) {	
 	## get status of all jobs
 	my $failed = my $finished = my $running = my $pending = 0; ## Now see how many are running and how many are pending
 
@@ -176,7 +143,51 @@ if ($jobs_failed != 0) {
 	print "SUCCESS!! All the jobs finished successfully\n";
 }
 
-######
+######## Functions #####
+
+sub action_clean {
+	my $jobs_dir = $home_dir."/.jobs_input/$jobs_name";
+	die "The jobs directory '$jobs_dir' does not exist. So nothing will be cleaned\n" if (! -d $jobs_dir);
+	
+	my $delete_call = "rm -r $jobs_dir";
+	system($delete_call) == 0 || die "Error cleaning the jobs directory '$jobs_dir'\n";
+	exit;
+}
+
+sub action_crashed {
+	## find the stdout directory associated with the jobs list
+	my $jobs_stderr = "$home_dir/\.jobs_input/$jobs_name/stdout";
+	my $ls = `ls $jobs_stderr`;
+	
+	foreach my $file(split /\n/,$ls) {
+		my $stdout_file = "$jobs_stderr/$file";
+		my $job_ct = $file;
+		$job_ct =~s/o.//;
+		
+		my $job_status = check_job_failed($stdout_file);
+		if ($job_status == 1) {
+			my $job_file = "$home_dir/\.jobs_input/$jobs_name/o.$job_ct";
+			my $job_line = extract_job_line($job_file);
+			print "$job_line\n";	
+		}
+	}
+	exit;
+}
+
+sub action_stop {
+	## Get the job-ids file that contains information about the current set of jobs and then do a qdel on these jobs
+	my $job_ids_file = "$home_dir/\.jobs_input/$jobs_name/jobIDs.txt";
+	die "Cannot find the job_id file '$job_ids_file'. Aborting\n" if (! -e $job_ids_file);
+	open(FI,"$job_ids_file");
+	while (my $job = <FI>) {
+		chomp $job;
+		`qdel $job`;
+	}
+	close FI;
+	print "Stopped jobs for the jobsList '$jobs_name'\n";
+	exit;
+}
+
 sub create_job_file {
 	my ($stdout,$stderr,$job_file,$line) = @_;
 	open(FO,">$job_file") || die "Error writing to jobs input file '$job_file'\n";
